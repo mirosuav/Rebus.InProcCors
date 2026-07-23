@@ -1,117 +1,111 @@
-# 13 — Transport in-proc dla Rebusa: przekazywanie przez referencję + weryfikacja serializowalności
+# Rebus.InProcCors
 
-Wtyczka do Rebusa dla modular monolith: moduły komunikują się przez bus, ale wewnątrz procesu wiadomość leci **przez referencję** zamiast przez serializację. Ekstrakcja modułu do osobnej usługi = zmiana jednej linii konfiguracji transportu, bez zmiany kodu handlerów. Serializowalność wiadomości pilnuje osobny test refleksyjny.
+A Rebus plugin for modular monoliths: modules talk to each other over the bus, but **within a single process the message travels by reference** instead of being serialized. Extracting a module into a standalone service is a one-line transport configuration change — handler code is untouched. Message serializability is policed separately, by a reflective test.
 
-## Status (2026-07): tor „Pętla" — narzędzie wewnętrzne + content
+## Goal
 
-**To nie jest pomysł produktowy i nie zajmuje slotu bibliotecznego.** Powstaje w systemie, który autor i tak utrzymuje i w którym ma wolne ręce; koszt portfelowy ≈ 0. Publiczna wartość to **benchmark i seria contentowa**, nie paczka na NuGet.
-
-Warunek powrotu po slot produktowy: twardy dowód popytu spoza własnego systemu. Nie „to jest ciekawe" — dowód.
-
-### Dlaczego to nie jest odmrożenie [09](../09-messaging-library-alternative/README.md#walidacja-i-zamknięcie-2026-07)
-
-[Zasada z CLAUDE.md](../CLAUDE.md#decyzja-4--zamknięcie-portfela-trzy-filtry-dwa-tory-2026-07) zakazuje odmrażania bez nowego dowodu. 13 nie odmraża 09 — **jest innym obiektem**:
-
-| Zarzut zamykający 09 | Czy dotyczy 13 |
-|---|---|
-| „N transportów × wersje brokerów × edge case'y sieciowe" → projekt firma, nie produkt pasywny | **Nie.** 13 nie buduje żadnego transportu do brokera. Transporty utrzymuje Rebus; 13 dokłada jeden transport in-proc |
-| Dwa darmowe incumbenty do pobicia naraz (Wolverine + Rebus) | **Nie.** Rebus nie jest konkurentem, tylko platformą, do której 13 się wpina |
-| Horyzont przychodu 2–3 lata | **Nie dotyczy.** 13 nie ma modelu przychodu i nie aspiruje do niego |
-| Pass-by-reference to footgun bez mitygatora | **Dotyczy** — patrz [Świadomie zaakceptowane ryzyko](#świadomie-zaakceptowane-ryzyko-aliasing) |
-
-Gdyby 13 kiedykolwiek miało wrócić jako produkt, wszystkie cztery wracają na stół razem z nim.
+Keep the bus as the module boundary without paying the serialization tax on traffic that never leaves the process, and without weakening the guarantee that the same handler code will still work once a module is carved out.
 
 ## Problem
 
-Rebus serializuje wiadomości **także w transporcie in-memory** — celowo, dla wierności produkcji. W modular monolith, gdzie każdy moduł ma własny kontener DI, a bus jest wybrany właśnie po to, żeby moduł dało się później wyciąć do usługi, oznacza to podatek serializacyjny na **całej** komunikacji wewnątrzprocesowej.
+Rebus serializes messages **even on the in-memory transport** — deliberately, for production fidelity. In a modular monolith where each module owns its DI container, and the bus was chosen precisely so that a module can later be extracted into a service, this means a serialization tax on **all** in-process communication.
 
-Architektonicznie nie da się tego ominąć „od góry": `ITransport` Rebusa operuje na `TransportMessage`, która niesie `byte[] Body`.
+This cannot be bypassed "from above": Rebus's `ITransport` operates on `TransportMessage`, which carries a `byte[] Body`.
 
-## Zawór ucieczki: Wolverine ma to za darmo
+## Prior art: Wolverine gets this for free
 
-Reguła z [STRATEGY](../STRATEGY.md#reguła-zaworu-ucieczki-pierwszy-krok-każdej-walidacji) każe zacząć od pytania „co klient ma dziś za darmo". Odpowiedź jest twarda i wynika ze źródeł, nie z dokumentacji:
+Before building anything, ask what a user already has for free today. The answer here is firm, and it comes from the sources rather than the documentation:
 
-- `Wolverine/Transports/Local/BufferedLocalQueue.cs` — **nie ma pola `IMessageSerializer` w ogóle**. Wrzuca `Envelope` (trzymający referencję na obiekt) do in-memory `Block<Envelope>`. Zero serializacji.
-- `Wolverine/Transports/Local/DurableLocalQueue.cs` — **ma** `_serializer` i rzuca `ArgumentOutOfRangeException`, gdy go brak, bo persystuje do inboxa.
+- `Wolverine/Transports/Local/BufferedLocalQueue.cs` — has **no `IMessageSerializer` field at all**. It pushes an `Envelope` (which holds a reference to the object) into an in-memory `Block<Envelope>`. Zero serialization.
+- `Wolverine/Transports/Local/DurableLocalQueue.cs` — **does** hold a `_serializer` and throws `ArgumentOutOfRangeException` when it is missing, because it persists to an inbox.
 
-Czyli **pass-by-reference in-proc jest już darmowe i MIT** — dla trybu `EndpointMode.BufferedInMemory`. To zamyka drogę „to jest nowatorskie" i jest głównym powodem, dla którego 13 nie jest produktem.
+So **in-proc pass-by-reference is already free and MIT-licensed** — for `EndpointMode.BufferedInMemory`. That closes off any claim of novelty for the pass-by-reference part alone.
 
-Co przeżywa odjęcie Wolverine'a:
-1. **Wolverine nie ma weryfikacji serializowalności.** Ta część jest tą samą klasą wartości co fosa [07](../07-automapper-source-gen-alternative/) (orzekanie o poprawności, nie generowanie kodu → przechodzi [test odporności na AI](../STRATEGY.md#test-odporności-na-ai-przekrojowe-kryterium-selekcji)).
-2. **Wolverine zakłada jeden host i jeden kontener** (source-gen discovery po całej aplikacji). Izolacja DI per moduł to konfiguracja, którą Rebus obsługuje naturalnie (instancja busa per kontener, wspólna sieć in-proc), a Wolverine nie.
-3. Autor już stoi na Rebusie — koszt przełączenia na Wolverine jest realny i osobny.
+What survives once Wolverine is subtracted:
 
-Żadne z tych trzech nie jest wystarczające, żeby zbudować produkt. Wszystkie trzy wystarczają, żeby rozwiązać własny problem i zmierzyć różnicę.
+1. **Wolverine has no serializability verification.** This part is about *adjudicating correctness*, not generating code.
+2. **Wolverine assumes one host and one container** (source-gen discovery across the whole application). Per-module DI isolation is a configuration Rebus supports naturally — one bus instance per container, sharing an in-proc network — and Wolverine does not.
+3. Being already on Rebus makes switching to Wolverine a real and separate cost.
 
-## Konstrukcja
+None of these three alone justifies a product. Together they are enough to solve the problem at hand and to measure the difference.
 
-**Szew: własny `ITransport` + własny `ISerializer`.** Pipeline Rebusa (retry, sagi, outbox, headers, unit of work) zostaje nietknięty — dlatego podmiana na RabbitMQ jest zmianą konfiguracji, nie kodu.
+## Design
 
-Nośnik referencji: **podklasa `TransportMessage`** niosąca `object MessageInstance`.
+**The seam: a custom `ITransport` plus a custom `ISerializer`.** The Rebus pipeline — retries, sagas, outbox, headers, unit of work — is left untouched. That is exactly why swapping in RabbitMQ later is a configuration change rather than a code change.
 
-- `Rebus/Messages/TransportMessage.cs` to zwykła `public class`, **nie `sealed`** → dziedziczenie jest legalne.
-- `ISerializer.Deserialize(TransportMessage)` dostaje tę samą instancję, którą zwrócił transport → wystarczy rzutowanie w dół.
-- **Czasem życia zarządza GC.** Alternatywa (`ConcurrentDictionary<long, object>` + 8-bajtowy uchwyt w `Body`) wymagałaby sprzątania na ack/nack/retry/DLQ — każda nieobsłużona ścieżka to wyciek. Odrzucona.
+### Reference carrier
 
-Dlaczego nie da się użyć `InMemTransport` Rebusa: jego `Receive` woła `nextMessage.ToTransportMessage()`, co **tworzy nową** `TransportMessage` i gubi podklasę.
+A **subclass of `TransportMessage`** carrying an `object MessageInstance`.
 
-**Kolejka: `Channel<T>`.** `InMemNetwork` Rebusa stoi na `ConcurrentQueue`, a workery odpytują z backoffem. `Channel.Reader.WaitToReadAsync(cancellationToken)` czeka asynchronicznie → niższe opóźnienie i niższe CPU. Spodziewana wygrana **niezależna od serializacji** i potencjalnie od niej większa — to jest właściwy temat benchmarku.
+- `Rebus/Messages/TransportMessage.cs` is a plain `public class`, **not `sealed`**, so deriving from it is legal.
+- `ISerializer.Deserialize(TransportMessage)` receives the very instance the transport returned, so a downcast is sufficient.
+- **Lifetime is managed by the GC.** The alternative — a `ConcurrentDictionary<long, object>` plus an 8-byte handle stored in `Body` — would require cleanup on ack, nack, retry and DLQ; every unhandled path is a leak. Rejected.
 
-Transport wozi **jeden tryb: `Reference`.** Bez flag, bez trybów warunkowych. Weryfikacja żyje poza transportem (niżej).
+Rebus's own `InMemTransport` cannot be reused: its `Receive` calls `nextMessage.ToTransportMessage()`, which **constructs a new** `TransportMessage` and loses the subclass.
 
-### Czego świadomie nie robimy
+### Queue
 
-- **Statycznego analyzera Roslyn** serializowalności. Precedens [07](../07-automapper-source-gen-alternative/README.md#walidacja-wykonalności-2026-07): droga statyczna („Droga A") przegrywa z uruchomieniem prawdziwego pipeline'u, bo produkuje false-positives, a te kasują zaufanie. Serializowalność jest statycznie nierozstrzygalna w tych samych miejscach: właściwości typu `object`/interfejs, polimorfizm, otwarte generyki, cykle powstające z danych.
-- **Wymuszania niemutowalności** wiadomości.
-- **Abstrakcji nad brokerami.** To był zabójca 09.
-- **Czystych `Channels` bez Rebusa** dla ruchu in-proc — tracisz retry/sagi/outbox/headers i łamiesz główne założenie („ten sam kod działa po ekstrakcji").
+**`Channel<T>`.** Rebus's `InMemNetwork` sits on a `ConcurrentQueue`, and workers poll it with a backoff. `Channel.Reader.WaitToReadAsync(cancellationToken)` waits asynchronously, giving lower latency and lower CPU. This win is expected to be **independent of serialization**, and possibly larger than it — which makes it the real subject of the benchmark.
 
-## Weryfikacja serializowalności: test refleksyjny
+### One mode
 
-Nie jest częścią transportu. To zwykły test w suicie.
+The transport carries exactly one mode: **`Reference`**. No flags, no conditional modes. Verification lives outside the transport.
 
-1. **Enumeracja typów z rejestracji handlerów**, nie z konwencji nazewniczej: wyciągnij `T` ze wszystkich domknięć `IHandleMessages<T>` zarejestrowanych w kontenerach modułów. To ground truth — zero listy do utrzymywania, zero polegania na sufiksie `*Command`/`*Event`. Wiadomość bez handlera i tak jest martwym kodem.
-2. **Dla każdego typu: idempotencja round-tripu.** `s1 = serialize(instancja)`, `s2 = serialize(deserialize(s1))`, porównaj `s1` z `s2` **jako bajty**.
+### Deliberately out of scope
 
-Dlaczego porównanie serializacji, a nie obiektów: rekurencyjny comparer grafów produkuje false-positives na kolejności kolekcji, precyzji `DateTime` i zmiennoprzecinkowych — czyli dokładnie ten tryb porażki, który repo odrzuciło w 07. Porównanie dwóch `byte[]` nie ma tego problemu i nie wymaga pisania comparera.
+- **A static Roslyn analyzer for serializability.** The static route loses to running the real pipeline, because it produces false positives, and false positives destroy trust. Serializability is statically undecidable in precisely the places that matter: `object`- and interface-typed properties, polymorphism, open generics, and cycles that arise from data rather than from types.
+- **Enforcing message immutability.**
+- **Any abstraction over brokers.**
+- **Plain `Channels` without Rebus** for in-proc traffic — that forfeits retries, sagas, outbox and headers, and breaks the core premise that the same code keeps working after extraction.
 
-### Granica gwarancji
+## Serializability verification
 
-Nazwana wprost, bo gwarancja bez nazwanej granicy nie jest gwarancją (analogia: [mur zapytań dynamicznych w 07](../07-automapper-source-gen-alternative/README.md#dlaczego-nie-da-się-zwalidować-wszystkich-zapytań-ef)).
+Not part of the transport. An ordinary test in the suite.
 
-**Łapie:**
-- typ, którego serializer nie potrafi obsłużyć (wyjątek);
-- ciche gubienie danych **po stronie deserializacji** — `init`-only bez odpowiadającego parametru konstruktora, prywatny setter, właściwość interfejsu deserializowana do typu bazowego. `s2` różni się od `s1`.
+1. **Enumerate message types from handler registrations**, not from a naming convention: pull `T` out of every `IHandleMessages<T>` closure registered in the modules' containers. That is ground truth — no list to maintain, and no reliance on a `*Command` / `*Event` suffix. A message with no handler is dead code anyway.
+2. **For each type, check round-trip idempotence.** `s1 = serialize(instance)`, `s2 = serialize(deserialize(s1))`, then compare `s1` and `s2` **as bytes**.
 
-**Nie łapie:**
-- pól, których serializer **nigdy nie widział** (nie ma ich w `s1`, więc nie ma ich też w `s2`);
-- przypadków zależnych od **wartości runtime**, nie od typu: `object Payload`, kolekcja polimorficzna. Refleksja wylicza typy — nie potrafi wymyślić, co w produkcji wyląduje w środku. To ten sam mur, który w 07 ogranicza Drogę B (`kształt zależy od argumentów, których w build-time nie znasz`);
-- **aliasingu** — to własność handlerów, nie typów. Patrz niżej.
+Comparing serialized output rather than object graphs is deliberate: a recursive graph comparer produces false positives on collection ordering, `DateTime` precision and floating-point precision — exactly the failure mode being avoided. Comparing two `byte[]` values has none of those problems and requires no comparer to be written.
 
-## Świadomie zaakceptowane ryzyko: aliasing
+### Guarantee boundary
 
-`09/README:39` nazwał to wprost: „in-memory bez serializacji = mutowanie współdzielonych obiektów przez wiele handlerów; bez dobrego mitygatora wyróżnik staje się footgunem".
+Stated explicitly, because a guarantee without a stated boundary is not a guarantee.
 
-**Decyzja 2026-07: nie mitygujemy mechanicznie.** Zostaje dyscyplina i code review.
+**Caught:**
 
-Rozważone i odrzucone: tryb `Faithful` (round-trip oddający handlerowi kopię, uruchamiany w testach integracyjnych jako dowód, że żaden handler nie polega na aliasingu), source-gen deep clone, wymuszona niemutowalność.
+- a type the serializer cannot handle at all (it throws);
+- silent data loss **on the deserialization side** — an `init`-only property with no matching constructor parameter, a private setter, an interface-typed property deserialized to its base type. In each case `s2` differs from `s1`.
 
-**To był wybór, nie przeoczenie.** Konsekwencja do zapamiętania: bug aliasingu jest cichy — nic nie wybucha, dane są po prostu inne — i ujawni się dopiero w dniu ekstrakcji modułu do usługi, czyli dokładnie w dniu, dla którego cała ta konstrukcja istnieje. Jeśli kiedyś ten dzień się zbliży, mitygator wraca na stół przed ekstrakcją, nie po.
+**Not caught:**
 
-## Do zbadania
+- fields the serializer **never saw** — absent from `s1`, therefore also absent from `s2`;
+- cases that depend on **runtime values** rather than types: an `object Payload`, a polymorphic collection. Reflection enumerates types; it cannot guess what will actually end up inside them in production;
+- **aliasing** — a property of handlers, not of types. See below.
 
-Żywa lista — 13 nie jest zamknięte.
+## Accepted risk: aliasing
 
-- [ ] Czy pętla workera Rebusa poprawnie znosi `Receive` blokujące na `WaitToReadAsync` zamiast zwracać `null` przy pustej kolejce. **Pytanie do prototypu, nie do dokumentacji.** Jeśli nie — wygrana na pollingu przepada i zostaje sama serializacja
-- [ ] Czy kroki pipeline'u Rebusa (deferral, forward, obsługa błędów/DLQ) **odtwarzają** instancję `TransportMessage`. Jeśli tak, podklasa ginie w locie i wraca odrzucony wariant ze słownikiem uchwytów — razem z całym sprzątaniem. To jest ryzyko wywrotki dla całej konstrukcji, sprawdzić **pierwsze**
-- [ ] Izolacja DI per moduł: gdzie żyje wspólna instancja sieci in-proc, skoro każdy moduł ma własny kontener (rejestracja w kontenerze hosta i wstrzykiwanie w dół? statyczny singleton?)
-- [ ] Durability: moduł chcący durable in-proc **musi** serializować — ten sam mur, o który rozbija się `DurableLocalQueue` Wolverine'a. Czy dopuszczamy tryb mieszany (część kolejek referencyjna, część durable), czy durability wyklucza się z 13
-- [ ] Skąd brać instancje do testu refleksyjnego (ręczne fixture'y per typ vs generator typu AutoFixture) i co to robi z pokryciem klasy błędów zależnych od wartości
-- [ ] **Benchmark (materiał contentowy):** 13 vs `Rebus.InMem` vs `Wolverine.BufferedLocalQueue` — przepustowość, opóźnienie, alokacje. Rozdzielić dwie wygrane: brak serializacji vs `Channel<T>` zamiast pollingu. Bez tego rozdzielenia benchmark nie mówi nic ciekawego
+In-memory without serialization means shared objects can be mutated by multiple handlers; without a good mitigation, the differentiator turns into a footgun.
 
-## Źródła
+**Decision (2026-07): no mechanical mitigation.** Discipline and code review are what stands in its place.
+
+Considered and rejected: a `Faithful` mode (round-tripping so the handler receives a copy, run in integration tests to prove no handler depends on aliasing), source-generated deep cloning, and enforced immutability.
+
+**This was a choice, not an oversight.** The consequence worth remembering: an aliasing bug is silent — nothing blows up, the data is simply different — and it will surface only on the day a module is extracted into a service, which is precisely the day this whole construction exists for. If that day ever approaches, the mitigation goes back on the table *before* extraction, not after.
+
+## Open questions
+
+A live list — the design is not closed.
+
+- [ ] Does the Rebus worker loop correctly tolerate a `Receive` that blocks on `WaitToReadAsync` instead of returning `null` on an empty queue? **A question for a prototype, not for the documentation.** If it does not, the polling win disappears and only the serialization win remains.
+- [ ] Do the Rebus pipeline steps (deferral, forwarding, error/DLQ handling) **reconstruct** the `TransportMessage` instance? If they do, the subclass is lost in flight and the rejected handle-dictionary variant comes back, along with all of its cleanup. This is a wipeout risk for the entire design — **check it first**.
+- [ ] Per-module DI isolation: where does the shared in-proc network instance live, given that each module has its own container? Registered in the host container and injected downward, or a static singleton?
+- [ ] Durability: a module that wants durable in-proc delivery **must** serialize — the same wall Wolverine's `DurableLocalQueue` runs into. Do we allow a mixed mode, with some queues by reference and some durable, or does durability rule this design out entirely?
+- [ ] Where do instances for the reflective test come from — hand-written fixtures per type, or a generator such as AutoFixture — and what does that choice do to coverage of the value-dependent class of errors?
+- [ ] **Benchmark:** this transport vs `Rebus.InMem` vs `Wolverine.BufferedLocalQueue` — throughput, latency, allocations. The two wins must be separated: absence of serialization vs `Channel<T>` instead of polling. Without that separation the benchmark says nothing interesting.
+
+## Sources
 
 - `Rebus/Messages/TransportMessage.cs`, `Rebus/Serialization/ISerializer.cs`, `Rebus/Transport/ITransport.cs`, `Rebus/Transport/InMem/InMemTransport.cs` — https://github.com/rebus-org/Rebus
 - `src/Wolverine/Transports/Local/BufferedLocalQueue.cs`, `DurableLocalQueue.cs` — https://github.com/JasperFx/wolverine
 - https://wolverinefx.net/guide/messaging/transports/local.html
-- https://github.com/rebus-org/Rebus/issues/599 — mookid8000 potwierdza in-mem transport jako bus wewnątrzprocesowy
+- https://github.com/rebus-org/Rebus/issues/599 — mookid8000 confirms the in-mem transport as an in-process bus
