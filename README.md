@@ -6,6 +6,37 @@ A Rebus plugin for modular monoliths: modules talk to each other over the bus, b
 
 Keep the bus as the module boundary without paying the serialization tax on traffic that never leaves the process, and without weakening the guarantee that the same handler code will still work once a module is carved out.
 
+## Theoretical grounding
+
+The design is not novel in principle. It is an application of a well-established position, and naming that position is what keeps the decisions below from looking arbitrary.
+
+**Waldo, Wyant, Wollrath and Kendall, *A Note on Distributed Computing* (Sun, 1994)** identifies four irreducible differences between local and remote computing — **latency, memory access, partial failure, concurrency** — and argues that any system papering over the local/remote distinction fails to support basic requirements of robustness and reliability. All four are load-bearing here:
+
+| Difference | Where it appears in this design |
+|---|---|
+| Memory access | Pass-by-reference and aliasing — see [message contracts](#message-contracts-are-deeply-immutable) |
+| Partial failure | `bus.Send` cannot fail in-proc, can fail after extraction |
+| Latency | `SendRequest` chains that are free in-proc and are round trips afterwards |
+| Concurrency | Modules share one process and one thread pool in-proc, and do not after extraction |
+
+**Akka's location transparency** states the principle this project actually follows:
+
+> The key for enabling this is to go from remote to local by way of optimization instead of trying to go from local to remote by way of generalization.
+
+The direction matters. Waldo's warning is aimed at making *remote look local* — the RPC-transparency failure mode. This design does the inverse: it starts from remote semantics (queue, retries, dead-lettering, no inline exception propagation) and optimizes the local case. Everything is remote by default; in-proc is the optimization. That is the justification for leaving the Rebus pipeline untouched, and for [exception semantics](#exception-semantics) being identical in both shapes rather than "nicer" in-proc.
+
+**Orleans** solved the same problem with the opposite default, and its choice is instructive. Orleans deep-copies grain call arguments *even within a single silo*, specifically to stop the caller mutating them afterwards, and lets you opt out per type, parameter or field with `[Immutable]`. Its documentation is precise about what that opt-out means:
+
+> Using `Immutable<T>` implies neither the provider nor the recipient of the value will modify it in the future. It's a mutual, dual-sided commitment, not a one-sided one.
+
+And about what immutability has to mean to be worth anything:
+
+> …use bitwise immutability rather than logical immutability.
+
+This design inverts the default — reference always, never copy — which is only defensible because the commitment Orleans makes optional is made **mandatory and verified** here. See [message contracts](#message-contracts-are-deeply-immutable).
+
+**The fallacies of distributed computing** (Deutsch, Gosling) name the two beliefs the in-proc shape silently teaches call sites: *the network is reliable* and *latency is zero*. Both are true in-proc and false afterwards, which is why they are called out explicitly rather than left to be discovered.
+
 ## Mental model: one codebase, two runtime shapes
 
 The same handler code, the same `IBus` calls, and the same message contracts run in two shapes, selected by transport configuration alone.
@@ -139,7 +170,7 @@ The transport carries exactly one mode: **`Reference`**. No flags, no conditiona
 ### Deliberately out of scope
 
 - **A static Roslyn analyzer for serializability.** The static route loses to running the real pipeline, because it produces false positives, and false positives destroy trust. Serializability is statically undecidable in precisely the places that matter: `object`- and interface-typed properties, polymorphism, open generics, and cycles that arise from data rather than from types.
-- **Enforcing message immutability.**
+- **Enforcing immutability at runtime**, by copying or cloning. Immutability *is* required of message contracts, but it is checked over the contracts rather than bought with a per-message copy — see [message contracts](#message-contracts-are-deeply-immutable).
 - **Any abstraction over brokers.**
 - **Plain `Channels` without Rebus** for in-proc traffic — that forfeits retries, sagas, outbox and headers, and breaks the core premise that the same code keeps working after extraction.
 
@@ -165,17 +196,44 @@ Stated explicitly, because a guarantee without a stated boundary is not a guaran
 
 - fields the serializer **never saw** — absent from `s1`, therefore also absent from `s2`;
 - cases that depend on **runtime values** rather than types: an `object Payload`, a polymorphic collection. Reflection enumerates types; it cannot guess what will actually end up inside them in production;
-- **aliasing** — a property of handlers, not of types. See below.
+- **aliasing** — not a property this check speaks to at all. It is addressed separately, by requiring [deeply immutable contracts](#message-contracts-are-deeply-immutable) and verifying that requirement in the same test.
 
-## Accepted risk: aliasing
+## Message contracts are deeply immutable
 
-In-memory without serialization means shared objects can be mutated by multiple handlers; without a good mitigation, the differentiator turns into a footgun.
+Passing by reference means several handlers can hold the same instance. That is a hazard only if someone can mutate it. **If message contracts are deeply immutable, aliasing is harmless by construction** — which is the guarantee the actor model has always relied on, and the same guarantee Orleans buys by copying instead.
 
-**Decision (2026-07): no mechanical mitigation.** Discipline and code review are what stands in its place.
+**So immutability is required of every message contract, and it is verified rather than trusted.**
 
-Considered and rejected: a `Faithful` mode (round-tripping so the handler receives a copy, run in integration tests to prove no handler depends on aliasing), source-generated deep cloning, and enforced immutability.
+The requirement is Orleans' standard, adopted verbatim: **bitwise immutability, not logical immutability.** The object graph reachable from a message is not modified at all — not "modified only in thread-safe ways". And it is the dual-sided commitment Orleans describes: neither sender nor handler mutates the instance, ever.
 
-**This was a choice, not an oversight.** The consequence worth remembering: an aliasing bug is silent — nothing blows up, the data is simply different — and it will surface only on the day a module is extracted into a service, which is precisely the day this whole construction exists for. If that day ever approaches, the mitigation goes back on the table *before* extraction, not after.
+### Verified by the same reflective test
+
+No new machinery. The test that already enumerates message types from `IHandleMessages<T>` closures gains a second assertion:
+
+1. **Round-trip idempotence** — serializability, as described above.
+2. **Deep immutability** — every property is get-only or `init`-only, no field is publicly writable, no exposed member is a mutable collection type, and the check recurses transitively through the reachable graph.
+
+Both derive from the same ground-truth type enumeration, run in the same suite, and cost nothing at runtime.
+
+### Why this rather than the alternatives
+
+The options previously considered were all *runtime* mitigations, and each was rejected on cost:
+
+- a `Faithful` mode that round-trips so the handler receives a copy — reintroduces the serialization tax this project exists to remove, and requires the mode flag the transport deliberately does not have;
+- source-generated deep cloning — Orleans' approach, and viable, but Orleans pays that cost because it is a general-purpose framework that cannot know what its users will do. A known system optimising a known set of contracts does not have to;
+- enforced immutability by convention alone — unverified, therefore not a guarantee.
+
+Enforcing immutability *statically over the contracts* is the fourth option, and it dominates the others: zero runtime cost, no copy, no mode flag, and a real check instead of discipline.
+
+### Boundary
+
+What this does **not** cover:
+
+- **Mutable state reachable from an immutable message** — an immutable record holding a reference to a shared mutable service or cache. The check follows the message's own graph; it cannot know that some referenced object is a live handle. Keep contracts made of data.
+- **Mutation by reflection**, which nothing short of a runtime copy prevents.
+- **Interface- or `object`-typed members**, where the declared type may be immutable and the runtime instance not. This is the same runtime-versus-declared-type wall the serializability check hits, for the same reason.
+
+Where the contract genuinely cannot be immutable, the honest answer is not to weaken the rule but to send a projection of it that can be.
 
 ## Open questions
 
@@ -188,6 +246,8 @@ A live list — the design is not closed.
 - [ ] Where is the line between an expected failure mapped to a failure reply and an unexpected exception left to escape? Drawn wrongly in one direction it silently discards retries; in the other it turns routine domain rejections into dead letters.
 - [ ] Is a **symmetry test** worth writing — one asserting that a throwing handler produces the same observable outcome (retry count, error queue arrival, headers) on this transport and on a real broker? It would convert the claim of identical exception semantics from an argument into a check.
 - [ ] Does MediatR-like ergonomics tempt handlers into `SendRequest` chains that are free in-proc but become N sequential network round trips after extraction? If so, the mitigation is a review rule, not a mechanism — but it should be named before the first chain appears.
+- [ ] **Concurrency and bulkheading** — the fourth Waldo difference, and the one with no coverage yet. In-proc every module's handlers share one process and one thread pool, so a slow or blocking handler in one module starves another module's workers; after extraction they are isolated by definition. This degrades only under load, so no functional test will surface it. Do we bulkhead in-proc (per-module worker counts, separate schedulers) to keep the shapes comparable, or accept it and measure it in the benchmark?
+- [ ] How is the deep-immutability check implemented in practice — hand-rolled reflection over the reachable graph, or an existing analyzer? What is the escape hatch for a contract that legitimately cannot satisfy it, and who approves using it?
 - [ ] Per-module DI isolation: where does the shared in-proc network instance live, given that each module has its own container? Registered in the host container and injected downward, or a static singleton?
 - [ ] Durability: a module that wants durable in-proc delivery **must** serialize — the same wall Wolverine's `DurableLocalQueue` runs into. Do we allow a mixed mode, with some queues by reference and some durable, or does durability rule this design out entirely?
 - [ ] Where do instances for the reflective test come from — hand-written fixtures per type, or a generator such as AutoFixture — and what does that choice do to coverage of the value-dependent class of errors?
@@ -199,5 +259,8 @@ A live list — the design is not closed.
 - `src/Wolverine/Transports/Local/BufferedLocalQueue.cs`, `DurableLocalQueue.cs` — https://github.com/JasperFx/wolverine
 - https://github.com/rebus-org/Rebus.Async — synchronous request/reply over Rebus, including the author's caveats
 - https://www.nuget.org/packages/Rebus.Async — 10.0.0, `netstandard2.0`, requires Rebus >= 8.0.1
+- Waldo, Wyant, Wollrath, Kendall — *A Note on Distributed Computing*, Sun Microsystems Laboratories, 1994 — https://scholar.harvard.edu/files/waldo/files/waldo-94.pdf
+- Akka — *Location Transparency*, on optimizing remote-to-local rather than generalizing local-to-remote — https://doc.akka.io/libraries/akka-core/current/general/remoting.html
+- Orleans — *Serialization of immutable types*, deep copy by default and the `[Immutable]` opt-out — https://learn.microsoft.com/en-us/dotnet/orleans/host/configuration-guide/serialization-immutability
 - https://wolverinefx.net/guide/messaging/transports/local.html
 - https://github.com/rebus-org/Rebus/issues/599 — mookid8000 confirms the in-mem transport as an in-process bus
