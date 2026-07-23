@@ -50,6 +50,47 @@ Three caveats, carried deliberately:
 
 The package's own author cautions against leaning on it heavily, and prefers genuinely asynchronous modelling with explicit correlation identifiers. That advice is accepted here: `SendRequest` is the exception, not the default.
 
+### Exception semantics
+
+Stated explicitly, because the natural intuition — that in-proc a handler exception propagates to the caller while a distributed one does not — **is false for this design**.
+
+A handler never runs on the caller's stack. `bus.Send` writes into the `Channel<T>` and returns; a Rebus worker reads it and runs the incoming pipeline on its own thread. A handler exception is therefore caught by Rebus's retry machinery and ends in the error queue — **identically in both shapes**. This symmetry is a consequence of leaving the pipeline untouched, not something the transport has to add.
+
+Two compensations were considered and rejected:
+
+- **Swallowing and logging handler exceptions.** Actively harmful. The exception escaping the handler is the *signal* Rebus uses to decide retry and dead-lettering. Swallow it and Rebus sees success and acks the message — silent loss, in-proc only. The compensation would create the divergence it was meant to remove.
+- **Wrapping every handler exception** in a common type such as `MessageHandlerCaughtException(Exception inner)`. Less destructive, still a regression: retry policies, fail-fast checks and any custom `IErrorHandler` decide by exception type. Collapsing every failure into one wrapper erases the distinction those policies match on.
+
+Where the asymmetry actually lives:
+
+| Path | In-proc | Extracted |
+|---|---|---|
+| Handler throws | retry, then error queue | retry, then error queue — **same** |
+| `bus.Send` itself fails | effectively never | broker down, connection lost, message too large |
+| `SendRequest` times out | effectively never | genuine, routine failure path |
+
+The second row runs *opposite* to the intuition above and is the dangerous one: in-proc, `Send` succeeding is close to a certainty, so call sites are naturally written as though it cannot fail. After extraction it can.
+
+**Dead-lettering carries a live reference.** Rebus dead-letters by sending the failed `TransportMessage` to the error queue, which on this transport means the error queue holds a live reference to the message object. Two consequences with no distributed counterpart: the object cannot be collected while it sits there, and anything inspecting or replaying it receives the same mutable instance the failed handler may already have mutated.
+
+### Failure as part of the reply contract
+
+The one place worth designing for is `SendRequest`. When a handler throws, no reply is sent, the pending `TaskCompletionSource` never completes, and the caller waits out the entire timeout only to receive a `TimeoutException` that says nothing about the cause — in **both** shapes.
+
+The fix is not in the transport. It is to make failure an explicit part of the reply contract:
+
+```csharp
+public sealed record OrderPlaced(Guid OrderId);
+public sealed record OrderRejected(string Code, string Message);
+```
+
+The replier catches the expected failure, maps it to a failure reply and sends that. The caller gets a fast, typed, actionable answer instead of a slow timeout, and the behaviour is unchanged after extraction because a failure reply is an ordinary message.
+
+Two rules keep this honest:
+
+- **The failure reply carries a code and a message, never the exception object.** Passing a live `Exception` by reference would work in-proc and break at extraction — precisely the class of defect this project exists to prevent. Being an ordinary message contract, the failure reply is covered by the reflective serializability test for free.
+- **Mapping to a failure reply asserts that the failure is expected and final.** Unexpected exceptions must still escape the handler so that Rebus can retry and dead-letter them. Mapping everything into failure replies discards retries — the swallowing problem in better clothes.
+
 ## Problem
 
 Rebus serializes messages **even on the in-memory transport** — deliberately, for production fidelity. In a modular monolith where each module owns its DI container, and the bus was chosen precisely so that a module can later be extracted into a service, this means a serialization tax on **all** in-process communication.
@@ -143,6 +184,9 @@ A live list — the design is not closed.
 - [ ] Does the Rebus worker loop correctly tolerate a `Receive` that blocks on `WaitToReadAsync` instead of returning `null` on an empty queue? **A question for a prototype, not for the documentation.** If it does not, the polling win disappears and only the serialization win remains.
 - [ ] Do the Rebus pipeline steps (deferral, forwarding, error/DLQ handling) **reconstruct** the `TransportMessage` instance? If they do, the subclass is lost in flight and the rejected handle-dictionary variant comes back, along with all of its cleanup. This is a wipeout risk for the entire design — **check it first**. Include `Rebus.Async` in this check: it inserts its own pipeline step to intercept correlated replies, so it is an additional place the subclass can be dropped.
 - [ ] Does the `Rebus.Async` reply path work when the reply itself travels **by reference**? The reply is an ordinary message on this transport, so it should, but the correlation step and the `TaskCompletionSource` completion are the parts to verify rather than assume.
+- [ ] Should the transport **serialize on dead-letter**, as the single exception to the reference-only rule? The error queue is the one place where bytes are wanted anyway — it ends the live-reference retention, gives replay a clean instance rather than a mutated one, and proves serializability at exactly the moment it matters. Cost: the transport stops being strictly single-mode, which the design deliberately avoids.
+- [ ] Where is the line between an expected failure mapped to a failure reply and an unexpected exception left to escape? Drawn wrongly in one direction it silently discards retries; in the other it turns routine domain rejections into dead letters.
+- [ ] Is a **symmetry test** worth writing — one asserting that a throwing handler produces the same observable outcome (retry count, error queue arrival, headers) on this transport and on a real broker? It would convert the claim of identical exception semantics from an argument into a check.
 - [ ] Does MediatR-like ergonomics tempt handlers into `SendRequest` chains that are free in-proc but become N sequential network round trips after extraction? If so, the mitigation is a review rule, not a mechanism — but it should be named before the first chain appears.
 - [ ] Per-module DI isolation: where does the shared in-proc network instance live, given that each module has its own container? Registered in the host container and injected downward, or a static singleton?
 - [ ] Durability: a module that wants durable in-proc delivery **must** serialize — the same wall Wolverine's `DurableLocalQueue` runs into. Do we allow a mixed mode, with some queues by reference and some durable, or does durability rule this design out entirely?
