@@ -6,6 +6,50 @@ A Rebus plugin for modular monoliths: modules talk to each other over the bus, b
 
 Keep the bus as the module boundary without paying the serialization tax on traffic that never leaves the process, and without weakening the guarantee that the same handler code will still work once a module is carved out.
 
+## Mental model: one codebase, two runtime shapes
+
+The same handler code, the same `IBus` calls, and the same message contracts run in two shapes, selected by transport configuration alone.
+
+**While the system is a modular monolith**, bus traffic behaves much like MediatR: in-process, no broker, no network, and the message instance passed **by reference**. What differs from MediatR — and this difference is the entire point — is that the handler is **resolved from its own module's container, in a fresh scope**, rather than from the caller's ambient scope. The caller cannot leak a `DbContext`, an ambient transaction, or any of its own registrations into the handler, because it has no way to reach into the other module's container.
+
+**Once a module is extracted into a service**, the exact same code runs as an ordinary Rebus queue over whatever infrastructure sits underneath — RabbitMQ, Azure Service Bus, or anything else Rebus supports. Handler code does not change. The transport registration does.
+
+### Where the MediatR analogy stops
+
+The analogy is about *feel and cost*, not about semantics. Dispatch is **asynchronous handoff, not inline invocation**: `bus.Send` puts the message into the `Channel<T>` and returns, and a Rebus worker picks it up on another thread microseconds later. The handler has not run when `Send` returns, and a handler exception becomes a retry and then a dead-letter message — it never surfaces at the call site.
+
+| Aspect | MediatR | This transport, in-proc | After extraction |
+|---|---|---|---|
+| Transport | direct method call | `Channel<T>`, by reference | broker |
+| Serialization | none | none | yes |
+| Handler resolution | caller's ambient scope | own module's container, new scope | own module's container, new scope |
+| Completion awaited by caller | yes | no | no |
+| Handler exception surfaces | at the call site | retry, then DLQ | retry, then DLQ |
+| Retries, sagas, outbox, headers | no | yes | yes |
+| Latency | nanoseconds | microseconds | milliseconds |
+
+Note also that `ITransport.Send` enlists in the ambient transaction context, so a message sent *from inside a handler* is dispatched when that handler's unit of work commits — deferred by construction, in both shapes.
+
+### Request/reply ergonomics: Rebus.Async
+
+Where a caller genuinely needs an answer back, [`Rebus.Async`](https://github.com/rebus-org/Rebus.Async) supplies the MediatR-like shape without abandoning the messaging semantics:
+
+```csharp
+.Options(o => o.EnableSynchronousRequestReply())
+
+var reply = await bus.SendRequest<SomeReply>(new SomeRequest(), timeout: TimeSpan.FromSeconds(7));
+```
+
+This still travels the full transport — the request is dispatched, a worker handles it, the reply is correlated back and completes a pending `TaskCompletionSource`. It is *awaited* round-trip, not inline execution, so it survives extraction unchanged. Version 10.0.0 targets `netstandard2.0` and requires Rebus 8.0.1 or later.
+
+Three caveats, carried deliberately:
+
+- **It must be enabled at both ends**, requestor and replier. In-proc that is one configuration; after extraction it is two, in two repositories.
+- **The requestor holds transient in-memory state while awaiting.** If the process dies, the reply has nobody left to handle it. In-proc this is invisible, because requestor and replier are the same process and die together. After extraction they do not.
+- **The timeout changes character at extraction.** In-proc a seven-second timeout will essentially never fire; over a broker it is a live failure path. This is a silent-until-extraction-day risk, the class of defect this project exists to eliminate.
+
+The package's own author cautions against leaning on it heavily, and prefers genuinely asynchronous modelling with explicit correlation identifiers. That advice is accepted here: `SendRequest` is the exception, not the default.
+
 ## Problem
 
 Rebus serializes messages **even on the in-memory transport** — deliberately, for production fidelity. In a modular monolith where each module owns its DI container, and the bus was chosen precisely so that a module can later be extracted into a service, this means a serialization tax on **all** in-process communication.
@@ -97,7 +141,9 @@ Considered and rejected: a `Faithful` mode (round-tripping so the handler receiv
 A live list — the design is not closed.
 
 - [ ] Does the Rebus worker loop correctly tolerate a `Receive` that blocks on `WaitToReadAsync` instead of returning `null` on an empty queue? **A question for a prototype, not for the documentation.** If it does not, the polling win disappears and only the serialization win remains.
-- [ ] Do the Rebus pipeline steps (deferral, forwarding, error/DLQ handling) **reconstruct** the `TransportMessage` instance? If they do, the subclass is lost in flight and the rejected handle-dictionary variant comes back, along with all of its cleanup. This is a wipeout risk for the entire design — **check it first**.
+- [ ] Do the Rebus pipeline steps (deferral, forwarding, error/DLQ handling) **reconstruct** the `TransportMessage` instance? If they do, the subclass is lost in flight and the rejected handle-dictionary variant comes back, along with all of its cleanup. This is a wipeout risk for the entire design — **check it first**. Include `Rebus.Async` in this check: it inserts its own pipeline step to intercept correlated replies, so it is an additional place the subclass can be dropped.
+- [ ] Does the `Rebus.Async` reply path work when the reply itself travels **by reference**? The reply is an ordinary message on this transport, so it should, but the correlation step and the `TaskCompletionSource` completion are the parts to verify rather than assume.
+- [ ] Does MediatR-like ergonomics tempt handlers into `SendRequest` chains that are free in-proc but become N sequential network round trips after extraction? If so, the mitigation is a review rule, not a mechanism — but it should be named before the first chain appears.
 - [ ] Per-module DI isolation: where does the shared in-proc network instance live, given that each module has its own container? Registered in the host container and injected downward, or a static singleton?
 - [ ] Durability: a module that wants durable in-proc delivery **must** serialize — the same wall Wolverine's `DurableLocalQueue` runs into. Do we allow a mixed mode, with some queues by reference and some durable, or does durability rule this design out entirely?
 - [ ] Where do instances for the reflective test come from — hand-written fixtures per type, or a generator such as AutoFixture — and what does that choice do to coverage of the value-dependent class of errors?
@@ -107,5 +153,7 @@ A live list — the design is not closed.
 
 - `Rebus/Messages/TransportMessage.cs`, `Rebus/Serialization/ISerializer.cs`, `Rebus/Transport/ITransport.cs`, `Rebus/Transport/InMem/InMemTransport.cs` — https://github.com/rebus-org/Rebus
 - `src/Wolverine/Transports/Local/BufferedLocalQueue.cs`, `DurableLocalQueue.cs` — https://github.com/JasperFx/wolverine
+- https://github.com/rebus-org/Rebus.Async — synchronous request/reply over Rebus, including the author's caveats
+- https://www.nuget.org/packages/Rebus.Async — 10.0.0, `netstandard2.0`, requires Rebus >= 8.0.1
 - https://wolverinefx.net/guide/messaging/transports/local.html
 - https://github.com/rebus-org/Rebus/issues/599 — mookid8000 confirms the in-mem transport as an in-process bus
