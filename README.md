@@ -45,6 +45,51 @@ The same handler code, the same `IBus` calls, and the same message contracts run
 
 **Once a module is extracted into a service**, the exact same code runs as an ordinary Rebus queue over whatever infrastructure sits underneath — RabbitMQ, Azure Service Bus, or anything else Rebus supports. Handler code does not change. The transport registration does.
 
+## Usage
+
+The network is host-owned and passed explicitly — there is no static default, because a singleton would make two independent test fixtures silently share a network.
+
+```csharp
+var network = new InProcNetwork();
+
+// Module: orders
+Configure.With(ordersActivator)
+    .Transport(t => t.UseInProcTransport(network, "orders"))
+    .Start();
+
+// Module: shipping
+Configure.With(shippingActivator)
+    .Transport(t => t.UseInProcTransport(network, "shipping"))
+    .Start();
+```
+
+Extracting the shipping module is a change to one line, in one file:
+
+```csharp
+    .Transport(t => t.UseRabbitMq(connectionString, "shipping"))
+```
+
+Each module verifies its own contracts, on its own container:
+
+```csharp
+services.AddRebusInProcContractVerification();
+```
+
+Outside Production a violation fails startup; in Production it is logged and startup continues.
+
+Two receive modes are available. `Blocking` is the default and parks on the channel; `Polling` walks Rebus's ordinary backoff ladder. The difference is not visible under saturation and is roughly two and a half orders of magnitude on the first message after an idle period — see [the benchmark results](Docs/2026-08-01-benchmark-results.md).
+
+```csharp
+.Transport(t => t.UseInProcTransport(network, "orders", o => o.ReceiveMode = InProcReceiveMode.Polling))
+```
+
+`ReferenceSerializer` is registered by default. To configure serialization yourself, opt out of that registration first — Rebus throws on a duplicate primary registration, so the two cannot both be present:
+
+```csharp
+.Transport(t => t.UseInProcTransport(network, "orders", registerReferenceSerializer: false))
+.Serialization(s => s.UseReferenceSerializer())
+```
+
 ### Where the MediatR analogy stops
 
 The analogy is about *feel and cost*, not about semantics. Dispatch is **asynchronous handoff, not inline invocation**: `bus.Send` puts the message into the `Channel<T>` and returns, and a Rebus worker picks it up on another thread microseconds later. The handler has not run when `Send` returns, and a handler exception becomes a retry and then a dead-letter message — it never surfaces at the call site.
@@ -239,19 +284,19 @@ Where the contract genuinely cannot be immutable, the honest answer is not to we
 
 A live list — the design is not closed.
 
-- [ ] Does the Rebus worker loop correctly tolerate a `Receive` that blocks on `WaitToReadAsync` instead of returning `null` on an empty queue? **A question for a prototype, not for the documentation.** If it does not, the polling win disappears and only the serialization win remains.
-- [ ] Do the Rebus pipeline steps (deferral, forwarding, error/DLQ handling) **reconstruct** the `TransportMessage` instance? If they do, the subclass is lost in flight and the rejected handle-dictionary variant comes back, along with all of its cleanup. This is a wipeout risk for the entire design — **check it first**. Include `Rebus.Async` in this check: it inserts its own pipeline step to intercept correlated replies, so it is an additional place the subclass can be dropped.
-- [ ] Does the `Rebus.Async` reply path work when the reply itself travels **by reference**? The reply is an ordinary message on this transport, so it should, but the correlation step and the `TaskCompletionSource` completion are the parts to verify rather than assume.
-- [ ] Should the transport **serialize on dead-letter**, as the single exception to the reference-only rule? The error queue is the one place where bytes are wanted anyway — it ends the live-reference retention, gives replay a clean instance rather than a mutated one, and proves serializability at exactly the moment it matters. Cost: the transport stops being strictly single-mode, which the design deliberately avoids.
+- [x] Does the Rebus worker loop correctly tolerate a `Receive` that blocks on `WaitToReadAsync` instead of returning `null` on an empty queue? **A question for a prototype, not for the documentation.** If it does not, the polling win disappears and only the serialization win remains. — resolved, see `Docs/2026-07-31-rebus-inproccors-design.md` §2.1 and §6; both modes are implemented anyway, and the benchmark measures the difference.
+- [x] Do the Rebus pipeline steps (deferral, forwarding, error/DLQ handling) **reconstruct** the `TransportMessage` instance? If they do, the subclass is lost in flight and the rejected handle-dictionary variant comes back, along with all of its cleanup. This is a wipeout risk for the entire design — **check it first**. Include `Rebus.Async` in this check: it inserts its own pipeline step to intercept correlated replies, so it is an additional place the subclass can be dropped. — resolved, see `Docs/2026-07-31-rebus-inproccors-design.md` §2.2, §2.3 and §4. They do, at dead-letter and deferral; the subclass alone is insufficient, so a weak side table carries the reference across `Clone()`.
+- [x] Does the `Rebus.Async` reply path work when the reply itself travels **by reference**? The reply is an ordinary message on this transport, so it should, but the correlation step and the `TaskCompletionSource` completion are the parts to verify rather than assume. — resolved, see `Docs/2026-07-31-rebus-inproccors-design.md` §2.5. It does; `ReplyHandlerStep` operates on the deserialized `Message` and never touches `TransportMessage`.
+- [x] Should the transport **serialize on dead-letter**, as the single exception to the reference-only rule? The error queue is the one place where bytes are wanted anyway — it ends the live-reference retention, gives replay a clean instance rather than a mutated one, and proves serializability at exactly the moment it matters. Cost: the transport stops being strictly single-mode, which the design deliberately avoids. — resolved, see `Docs/2026-07-31-rebus-inproccors-design.md` §4. No: the weak table preserves the reference across `Clone()`, so the single-mode rule holds.
 - [ ] Where is the line between an expected failure mapped to a failure reply and an unexpected exception left to escape? Drawn wrongly in one direction it silently discards retries; in the other it turns routine domain rejections into dead letters.
 - [ ] Is a **symmetry test** worth writing — one asserting that a throwing handler produces the same observable outcome (retry count, error queue arrival, headers) on this transport and on a real broker? It would convert the claim of identical exception semantics from an argument into a check.
 - [ ] Does MediatR-like ergonomics tempt handlers into `SendRequest` chains that are free in-proc but become N sequential network round trips after extraction? If so, the mitigation is a review rule, not a mechanism — but it should be named before the first chain appears.
 - [ ] **Concurrency and bulkheading** — the fourth Waldo difference, and the one with no coverage yet. In-proc every module's handlers share one process and one thread pool, so a slow or blocking handler in one module starves another module's workers; after extraction they are isolated by definition. This degrades only under load, so no functional test will surface it. Do we bulkhead in-proc (per-module worker counts, separate schedulers) to keep the shapes comparable, or accept it and measure it in the benchmark?
-- [ ] How is the deep-immutability check implemented in practice — hand-rolled reflection over the reachable graph, or an existing analyzer? What is the escape hatch for a contract that legitimately cannot satisfy it, and who approves using it?
-- [ ] Per-module DI isolation: where does the shared in-proc network instance live, given that each module has its own container? Registered in the host container and injected downward, or a static singleton?
+- [x] How is the deep-immutability check implemented in practice — hand-rolled reflection over the reachable graph, or an existing analyzer? What is the escape hatch for a contract that legitimately cannot satisfy it, and who approves using it? — resolved, see `Docs/2026-07-31-rebus-inproccors-design.md` §10. Hand-rolled reflection now; the escape hatch is `[ImmutabilityExempt(reason)]` with a mandatory reason, listed in the report rather than silent, so it is approved in code review. A Roslyn analyzer is deferred but explicitly not ruled out — §14.
+- [x] Per-module DI isolation: where does the shared in-proc network instance live, given that each module has its own container? Registered in the host container and injected downward, or a static singleton? — resolved, see `Docs/2026-07-31-rebus-inproccors-design.md` §5. A host-owned instance, passed explicitly. No static singleton: it would make two independent test fixtures silently share a network.
 - [ ] Durability: a module that wants durable in-proc delivery **must** serialize — the same wall Wolverine's `DurableLocalQueue` runs into. Do we allow a mixed mode, with some queues by reference and some durable, or does durability rule this design out entirely?
-- [ ] Where do instances for the reflective test come from — hand-written fixtures per type, or a generator such as AutoFixture — and what does that choice do to coverage of the value-dependent class of errors?
-- [ ] **Benchmark:** this transport vs `Rebus.InMem` vs `Wolverine.BufferedLocalQueue` — throughput, latency, allocations. The two wins must be separated: absence of serialization vs `Channel<T>` instead of polling. Without that separation the benchmark says nothing interesting.
+- [x] Where do instances for the reflective test come from — hand-written fixtures per type, or a generator such as AutoFixture — and what does that choice do to coverage of the value-dependent class of errors? — resolved, see `Docs/2026-07-31-rebus-inproccors-design.md` §10. A deterministic non-default factory, with an `IMessageInstanceSource` override for what it cannot build. No AutoFixture: a flaky serialization test gets deleted.
+- [x] **Benchmark:** this transport vs `Rebus.InMem` vs `Wolverine.BufferedLocalQueue` — throughput, latency, allocations. The two wins must be separated: absence of serialization vs `Channel<T>` instead of polling. Without that separation the benchmark says nothing interesting. — resolved, see `Docs/2026-07-31-rebus-inproccors-design.md` §12 and the measurements in [`Docs/2026-08-01-benchmark-results.md`](Docs/2026-08-01-benchmark-results.md). Three arms separate the two wins; `Wolverine` was dropped in favour of comparing against `InMem` only. The separation mattered: under saturation the `Channel<T>` win is approximately zero, and the whole of it lands on the first message after an idle period.
 
 ## Sources
 

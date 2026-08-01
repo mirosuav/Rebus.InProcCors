@@ -62,7 +62,12 @@ A side table is therefore genuinely required.
 
 `netstandard2.0` is **not** targeted. That target is the only reason `System.Threading.Channels` would be a NuGet dependency; on `net6.0` and later it is in the shared framework. Dropping it gives zero package references while keeping `Channel<T>`.
 
-**Implementation note:** the .NET 10 SDK is not installed on the development machine at time of writing (`dotnet --list-sdks` reports 6.0.428 and 9.0.316). The initial `csproj` ships `net8.0;net9.0`; `net10.0` is added to `<TargetFrameworks>` once the SDK is available.
+**Implementation note (superseded).** This section originally recorded that the .NET 10 SDK was missing and that the initial `csproj` would ship `net8.0;net9.0`. That is no longer the situation. The development machine now has **only** the .NET 10 SDK and runtime (`10.0.302` / `10.0.10`) — there is no .NET 8 or .NET 9 runtime, so a project targeting `net9.0` compiles but cannot launch.
+
+What is implemented, per the project owner's explicit decision:
+
+- **`src/` libraries** multi-target `net8.0;net9.0;net10.0`. The 8 and 9 targets are **compile-only**, built against targeting packs. They are never executed; their purpose is to prove that the public surface stays within the .NET 8 baseline.
+- **Test and benchmark projects** target `net10.0` only, because that is the only runtime present.
 
 ## 4. The reference carrier
 
@@ -164,11 +169,19 @@ The transport and the serializer are **independent**. The transport carries any 
 .Transport(t => t.UseInProcTransport(network, "orders"))
 .Transport(t => t.UseInProcTransport(network, "orders", o => o.ReceiveMode = InProcReceiveMode.Polling))
 .Transport(t => t.UseInProcTransportAsOneWayClient(network))
+
+// Explicit serialization: opt out of the default registration first.
+.Transport(t => t.UseInProcTransport(network, "orders", registerReferenceSerializer: false))
+.Serialization(s => s.UseReferenceSerializer())
 ```
 
 Mirrors `InMemTransportConfigurationExtensions`, including registering the network as `ISubscriptionStorage` by default so pub/sub needs no extra configuration, and calling `OneWayClientBackdoor.ConfigureOneWayClient` for the one-way overload.
 
-`ReferenceSerializer` is registered as the `ISerializer` via `PossiblyRegisterDefault` semantics — a default, so an explicit `.Serialization(...)` call still wins.
+**Correction C1 — there is no `PossiblyRegisterDefault` to use.** This section previously said `ReferenceSerializer` is registered "via `PossiblyRegisterDefault` semantics — a default, so an explicit `.Serialization(...)` call still wins." That mechanism is not reachable from a transport extension: `PossiblyRegisterDefault` is **private to `RebusConfigurer`**, and the only registration primitive available here is `Injectionist.Register`, which **throws on a duplicate primary registration**. So a `ReferenceSerializer` registration and an explicit `.Serialization(...)` call cannot both be present — the second one fails loudly rather than losing gracefully.
+
+The resolution is a `bool registerReferenceSerializer = true` parameter, mirroring Rebus's own `registerSubscriptionStorage` precedent on the InMem extension. Callers who want to configure serialization explicitly opt out of the default registration first.
+
+This is proven, not merely asserted: `ConfigurationTests.RegisteringTheSerializerTwiceFailsLoudly` demonstrates the `Injectionist` throwing on the duplicate. The flag also has an independent second justification — benchmark arm 2 (`InProcJson`, §12) needs the InProc transport *with* the stock JSON serializer, which is only expressible through it.
 
 ## 9. Unsupported configurations
 
@@ -189,8 +202,8 @@ services.AddRebusInProcContractVerification();
 
 services.AddRebusInProcContractVerification(o =>
 {
-    o.VerifyOnStartup = true;      // default: true outside Production
-    o.Serializer = mySerializer;   // default: SystemTextJsonSerializer
+    o.VerifyOnStartup = true;      // default: true, in every environment
+    o.Serializer = mySerializer;   // default: SystemTextJsonContractSerializer
 });
 ```
 
@@ -223,7 +236,11 @@ It also saves nothing. Discovery is a list scan over `ServiceDescriptor`s; the c
 
 ### Check 1 — round-trip byte idempotence
 
-`s1 = serialize(x)`, `s2 = serialize(deserialize(s1))`, compare `s1.Body` and `s2.Body` as bytes, using the same `ISerializer` the extracted service will use (`SystemTextJsonSerializer` by default, injectable).
+`s1 = serialize(x)`, `s2 = serialize(deserialize(s1))`, compare `s1.Body` and `s2.Body` as bytes, using the same `ISerializer` the extracted service will use (`SystemTextJsonContractSerializer` by default, injectable).
+
+**Correction C2 — the verification package ships its own serializer.** This section previously named `SystemTextJsonSerializer`, meaning Rebus's own. That type is **`internal` to the Rebus assembly** and cannot be constructed from outside it, so `Rebus.InProcCors.Verification` owns a ~50-line public `SystemTextJsonContractSerializer` instead. (Rebus's `SimpleAssemblyQualifiedMessageTypeNameConvention` is internal for the same reason, so the package carries an equivalent convention as a nested private class.) Owning it is the better default regardless: the byte output of this serializer is precisely what the check compares, so it should be pinned and explicit rather than inherited from whatever Rebus does this release.
+
+**`VerifyOnStartup` is `true` unconditionally.** The startup snippet above originally commented it as "default: true outside Production". It is implemented as `true` in every environment, with the *environment* deciding throw-versus-log inside the hosted service — which is what "Startup behaviour" below specifies, and the better shape: the check still runs in Production, so a violation is logged rather than invisible.
 
 ### Check 2 — deep immutability
 
@@ -252,6 +269,14 @@ Instances are built by `DefaultMessageInstanceFactory`: the greediest public con
 Non-default values are load-bearing. Filled with defaults (`null`, `0`, `""`), a property the serializer silently drops is invisible — default in `s1`, default after deserialization, default in `s2`, bytes equal, test green. The check only has teeth when every value differs from the type's default.
 
 No AutoFixture dependency: determinism matters more than variety, because a flaky serialization test gets deleted. `IMessageInstanceSource` allows a per-type override for contracts the factory cannot construct.
+
+**The constructor alone is not enough.** This section originally described construction as ending at the greediest constructor. Filling only constructor parameters makes Check 1 **vacuously green**, for a reason the "non-default values are load-bearing" paragraph above almost states but stops one step short of: a deserializer *runs the constructor*, so every value the constructor establishes is re-established on the way back. Nothing a constructor sets can ever be observed as lost. Only state set **outside** the constructor can be.
+
+The factory therefore also fills every writable property the constructor did not cover — including `init`-only and **private** setters, which is exactly the state space code inside the contract's own assembly can put an instance into. With that, a private setter (which `System.Text.Json` cannot restore) produces genuinely different bytes and is caught.
+
+A corollary worth stating, because the implementation plan assumed the opposite: **`init`-only properties round-trip correctly.** `init` is a compile-time-only restriction — the setter is an ordinary public setter in IL, distinguished solely by the `IsExternalInit` modreq — so `System.Text.Json` populates it happily. An init-only property with no matching constructor parameter is *not* a defect, and the check correctly does not flag one.
+
+**Known limitation.** Byte comparison cannot see a member that is absent from `s1` in the first place. A public writable **field** is the case in practice: `System.Text.Json` does not serialize fields unless `IncludeFields` is set, so the field is missing from both passes and the bytes match. Check 2 flags public writable fields as an immutability violation regardless, so the case is covered — but by the other check, not this one.
 
 ### Escape hatch
 
@@ -316,3 +341,21 @@ Not blocking implementation; recorded so they are not lost.
 - **`SendRequest` chain discipline** — free in-proc, N sequential round trips after extraction. A review rule, not a mechanism; no tooling planned.
 - **Symmetry test against a real broker** — would convert the claim of identical exception semantics into a check. Out of scope for this cut.
 - **Where the line falls** between an expected failure mapped to a failure reply and an unexpected exception left to escape. A per-system judgement, documented in the README, not enforced by the library.
+
+## 15. Rebus APIs this document described that do not exist
+
+Corrections C1–C3 are folded into §8, §10 and §3 above. The remainder are recorded here because the design and its implementation plan describe Rebus APIs by name, and several of those names are wrong. Each was found by dumping the real Rebus 8.9.2 assembly surface by reflection — not guessed at — and each is reflected in shipped, passing tests.
+
+**C4 — a nack is not reachable through `RebusTransactionScope`.** The plan asserted that "disposing a scope without completing rolls it back, which fires `OnNack`." It does not. `Dispose()` fires **only** `OnDisposed`, and `CompleteAsync()` forces `SetResult(commit: true, ack: true)`, so it cannot express a nack either. Rebus's worker drives a nack via `SetResult(false, false)` followed by `TransactionContext.Complete()` — and **`Complete()` is not on `ITransactionContext`**; it is on the internal concrete type. `RebusTransactionScope` is a *sending* abstraction, while ack/nack is a *receiving* concept, and the two do not meet.
+
+`ANackedMessageGoesBackOntoTheQueue` therefore uses a hand-rolled `CallbackCapturingTransactionContext` implementing the six public interface members, capturing and firing the callback the way the worker would. That was chosen over reflecting into the internal `Complete()`, which would couple the test suite to a detail that can change in any patch release. **The transport code was correct; only the test's model of Rebus was wrong.**
+
+**C5 — `BuiltinHandlerActivator.UseServiceProvider` does not exist.** It ships in the separate `Rebus.ServiceProvider` package, which this solution does not reference. The activator offers only `Handle<T>` and `Register<THandler>`. The `TestModule` fixture links each module's container explicitly via `activator.Register<THandler>(() => …)` resolving from that module's own provider — which is the point of the fixture either way.
+
+**C6 — `OptionsConfigurer.UseInMemoryTimeoutManager` does not exist.** Only `UseExternalTimeoutManager(StandardConfigurer<ITimeoutManager>, string)` exists; an in-memory timeout manager is **Rebus's default**. The deferral test simply drops the call.
+
+**C7 — `Rebus.Async` namespaces.** `EnableSynchronousRequestReply` is in **`Rebus.Config`**, not `Rebus.Async.Config`. `SendRequest` is in namespace `Rebus`.
+
+**`Defer` requires routing; `DeferLocal` does not.** `Defer` resolves its destination through the router, so the deliberately routing-free `TestModule` fixture threw `Cannot get destination for message of type …`. The deferral test uses `DeferLocal`, which exercises the identical timeout-manager path. A real deployment configures routing and never hits this.
+
+**Confirmed correct as written** (checked against the assembly, no change needed): `RetryStrategy(maxDeliveryAttempts:, errorQueueName:)` in `Rebus.Retry.Simple`; `Headers.ErrorDetails` = `rbs2-error-details`; `Headers.Type` = `rbs2-msg-type`; `IMessageTypeNameConvention` is public with exactly `GetTypeName(Type)` / `GetType(string)`.
