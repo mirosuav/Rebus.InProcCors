@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <PackageId>Rebus.InProcCors</PackageId>
+    <Description>Rebus transport that passes messages by reference within a single process.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Rebus" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Rebus.InProcCors.Tests" />
+    <InternalsVisibleTo Include="Rebus.InProcCors.Benchmarks" />
+  </ItemGroup>
+</Project>
