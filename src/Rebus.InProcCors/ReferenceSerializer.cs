@@ -7,7 +7,7 @@ namespace Rebus.InProcCors;
 /// An <see cref="ISerializer"/> that does not serialize. It attaches the live message object to the
 /// transport message by two independent carriers and hands the identical instance back on the way in.
 /// <para>
-/// The transport and the serializer are independent: <c>InProcTransport</c> carries any transport
+/// The transport and the serializer are independent: <see cref="InProcTransport"/> carries any transport
 /// message, so pairing it with an ordinary JSON serializer is valid and supported.
 /// </para>
 /// </summary>
