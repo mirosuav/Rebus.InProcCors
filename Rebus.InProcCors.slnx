@@ -1,8 +1,10 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/Rebus.InProcCors.Verification/Rebus.InProcCors.Verification.csproj" />
     <Project Path="src/Rebus.InProcCors/Rebus.InProcCors.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Rebus.InProcCors.Tests/Rebus.InProcCors.Tests.csproj" />
+    <Project Path="tests/Rebus.InProcCors.Verification.Tests/Rebus.InProcCors.Verification.Tests.csproj" />
   </Folder>
 </Solution>
