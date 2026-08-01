@@ -1,7 +1,7 @@
 namespace Rebus.InProcCors;
 
 /// <summary>
-/// Thrown by <c>ReferenceSerializer</c> when neither the transport message subclass nor the weak
+/// Thrown by <see cref="ReferenceSerializer"/> when neither the transport message subclass nor the weak
 /// side table can supply the message instance. Encryption, compression and the data bus claim-check step
 /// all construct a new transport message around a different body, defeating both carriers. None of the
 /// three is meaningful for in-process traffic (design §9).
