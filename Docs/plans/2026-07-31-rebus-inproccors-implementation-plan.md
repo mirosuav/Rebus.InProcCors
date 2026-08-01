@@ -2,6 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> ## ⚠ EXECUTION STATUS — read `Docs/HANDOFF.md` before continuing
+>
+> **Tasks 1–7 are DONE, committed and pushed** (HEAD `855aec3`, 61 tests passing). **Resume at Task 8.**
+>
+> Several code blocks below call Rebus APIs that **do not exist** in 8.9.2 and were corrected during
+> implementation — `BuiltinHandlerActivator.UseServiceProvider`, `OptionsConfigurer.UseInMemoryTimeoutManager`,
+> the `Rebus.Async.Config` namespace, and the nack-on-scope-dispose premise in Task 5. The target frameworks
+> in Global Constraints are also stale (this machine now has only the .NET 10 SDK). All corrections, with
+> evidence, are in `Docs/HANDOFF.md` — **Task 13 must fold them into the design document.**
+>
+> Treat the code blocks below as intent, not as compiling source.
+
 **Goal:** Build a Rebus transport + serializer that pass messages by reference within one process, plus a separate library that verifies message contracts are round-trip serializable and deeply immutable.
 
 **Architecture:** `InProcTransport` derives from `AbstractRebusTransport` and moves `TransportMessage` instances through per-queue unbounded `Channel<T>`s held by a host-owned `InProcNetwork`. `ReferenceSerializer` puts the live message object on a `TransportMessage` subclass and registers it in a `ConditionalWeakTable` keyed by a freshly allocated 1-byte sentinel `Body`, so the reference survives the `Clone()` that the dead-letter and deferral paths perform. `Rebus.InProcCors.Verification` is an independent package that discovers message types from `IHandleMessages<T>` DI registrations and asserts serializability and deep immutability by reflection.
