@@ -7,6 +7,10 @@ public class ThroughputBenchmark
 {
     const int MessageCount = 10_000;
 
+    // Built once, sent 10,000 times. Constructing the (deliberately fat) message inside the measured loop
+    // would charge every arm the same allocation cost and dilute the difference the benchmark exists to show.
+    static readonly BenchmarkMessage Message = BenchmarkMessage.CreateSample();
+
     BusArm _arm = null!;
     CountdownEvent _countdown = null!;
 
@@ -38,7 +42,7 @@ public class ThroughputBenchmark
     {
         for (var i = 0; i < MessageCount; i++)
         {
-            _arm.Bus.SendLocal(new BenchmarkMessage("ABC", i, Guid.NewGuid())).GetAwaiter().GetResult();
+            _arm.Bus.SendLocal(Message).GetAwaiter().GetResult();
         }
 
         if (!_countdown.Wait(TimeSpan.FromMinutes(2)))
