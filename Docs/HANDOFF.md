@@ -150,7 +150,10 @@ Nothing in the plan. Genuinely open items, in rough order of how load-bearing th
    not quotable without a real run.
 3. **Durability**, **`SendRequest` chain discipline**, **the symmetry test against a real broker**, and
    **where the expected/unexpected failure line falls** — the four remaining unchecked README questions.
-4. **A Roslyn analyzer for deep immutability**, deferred but explicitly not ruled out. Design §14 argues
+4. **Remote handler cancellation** — a transport-agnostic `CancelRemoteMessage(MessageId)` protocol, explored
+   2026-08-09 and left at an open decision. See `Docs/2026-08-09-remote-cancellation-handoff.md`. Note that
+   it turns item 1 above from a throughput question into a correctness one.
+5. **A Roslyn analyzer for deep immutability**, deferred but explicitly not ruled out. Design §14 argues
    the README's blanket rejection of static analysis does not apply to immutability.
 
 Nothing has been published to NuGet. `Version` is `0.1.0` in `Directory.Build.props`.

@@ -2,6 +2,11 @@
   <Folder Name="/benchmarks/">
     <Project Path="benchmarks/Rebus.InProcCors.Benchmarks/Rebus.InProcCors.Benchmarks.csproj" />
   </Folder>
+  <Folder Name="/SoluionItems/">
+    <File Path="Directory.Build.props" />
+    <File Path="Directory.Packages.props" />
+    <File Path="README.md" />
+  </Folder>
   <Folder Name="/src/">
     <Project Path="src/Rebus.InProcCors.Verification/Rebus.InProcCors.Verification.csproj" />
     <Project Path="src/Rebus.InProcCors/Rebus.InProcCors.csproj" />
