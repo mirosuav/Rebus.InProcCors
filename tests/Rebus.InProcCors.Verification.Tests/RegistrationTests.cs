@@ -144,6 +144,26 @@ public class RegistrationTests
     }
 
     [Fact]
+    public async Task VerifyImmutabilityFalseLetsALegacyDtoModuleStart()
+    {
+        var loggerProvider = new RecordingLoggerProvider();
+
+        using var provider = BuildProvider(services =>
+        {
+            services.AddRebusInProcContractVerification(o => o.VerifyImmutability = false);
+            services.AddTransient<IHandleMessages<BadOrder>, BadOrderHandler>();
+        }, Environments.Development, loggerProvider);
+
+        await provider.GetServices<IHostedService>().Single().StartAsync(CancellationToken.None);
+
+        Assert.DoesNotContain(loggerProvider.Entries, e => e.Level == LogLevel.Error);
+
+        // Silence would be dishonest: the module verified less than the default and its log must say so.
+        Assert.Contains(loggerProvider.Entries,
+            e => e.Level == LogLevel.Information && e.Message.Contains("immutability", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public void VerifyOnStartupFalseRegistersNoHostedService()
     {
         using var provider = BuildProvider(services =>

@@ -23,7 +23,8 @@ Everything below is about the reframed version. The original framing is dead —
 
 # 2. Verified assembly facts
 
-Dumped by reflection from the real packages, per the working agreement in `HANDOFF.md`. These are facts, not
+Dumped by reflection from the real packages, per the working agreement in
+[`PRD.md` Appendix B](PRD.md#appendix-b-rebus-apis-that-do-not-exist). These are facts, not
 recollection. Do not re-derive them.
 
 ## `Rebus.Async` 10.0.0 — the entire type list

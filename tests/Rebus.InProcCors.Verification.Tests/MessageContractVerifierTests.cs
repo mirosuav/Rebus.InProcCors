@@ -159,6 +159,74 @@ public class MessageContractVerifierTests
         Assert.DoesNotContain(report.Violations, v => v.Check == VerificationCheck.Construction);
     }
 
+    [Fact]
+    public void AMutableContractPassesWhenImmutabilityVerificationIsTurnedOff()
+    {
+        // The legacy case: hundreds of plain DTOs that will never be made immutable, where the round-trip
+        // check is still worth having.
+        var services = new ServiceCollection();
+        services.AddTransient<IHandleMessages<BadOrder>, BadOrderHandler>();
+
+        var report = MessageContractVerifier
+            .ForHandlersIn(new MessageContractVerificationOptions { VerifyImmutability = false }, services)
+            .Verify();
+
+        Assert.True(report.IsSuccess, report.Describe());
+        Assert.DoesNotContain(report.Violations, v => v.Check == VerificationCheck.Immutability);
+    }
+
+    [Fact]
+    public void TurningOffImmutabilityDoesNotTurnOffTheRoundTripCheck()
+    {
+        // The flag must be surgical. A mute button would look identical on a legacy codebase, where a quiet
+        // report is exactly what is expected.
+        var services = new ServiceCollection();
+        services.AddTransient<IHandleMessages<MutableAndUnserializable>, MutableAndUnserializableHandler>();
+
+        var report = MessageContractVerifier
+            .ForHandlersIn(new MessageContractVerificationOptions { VerifyImmutability = false }, services)
+            .Verify();
+
+        Assert.False(report.IsSuccess);
+        var violation = Assert.Single(report.Violations);
+        Assert.Equal(VerificationCheck.RoundTrip, violation.Check);
+    }
+
+    [Fact]
+    public void TheReportSaysWhetherImmutabilityWasChecked()
+    {
+        var services = new ServiceCollection();
+        services.AddTransient<IHandleMessages<GoodOrder>, GoodOrderHandler>();
+
+        var checkedReport = MessageContractVerifier.ForHandlersIn(services).Verify();
+        var uncheckedReport = MessageContractVerifier
+            .ForHandlersIn(new MessageContractVerificationOptions { VerifyImmutability = false }, services)
+            .Verify();
+
+        Assert.True(checkedReport.ImmutabilityVerified);
+        Assert.False(uncheckedReport.ImmutabilityVerified);
+        Assert.DoesNotContain("immutability", checkedReport.Describe(), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("immutability check disabled", uncheckedReport.Describe(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    public sealed class MutableAndUnserializable
+    {
+        public MutableAndUnserializable(int quantity) => Quantity = quantity;
+
+        public int Quantity { get; }
+
+        /// <summary>Publicly writable, so the immutability check would fail it.</summary>
+        public string Sku { get; set; } = "";
+
+        /// <summary>System.Text.Json ignores the non-public setter, so the round trip loses the value.</summary>
+        public string Code { get; private set; } = "";
+    }
+
+    sealed class MutableAndUnserializableHandler : IHandleMessages<MutableAndUnserializable>
+    {
+        public Task Handle(MutableAndUnserializable message) => Task.CompletedTask;
+    }
+
     public sealed class Unconstructable
     {
         Unconstructable(string sku) => Sku = sku;

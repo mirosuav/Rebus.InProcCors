@@ -15,6 +15,18 @@ public sealed class MessageContractVerificationOptions
     public bool VerifyOnStartup { get; set; } = true;
 
     /// <summary>
+    /// Gets or sets whether the deep-immutability check runs. Defaults to true. Turning it off is the one
+    /// escape hatch, and it is deliberately all-or-nothing per module: a legacy module whose hundreds of
+    /// plain-DTO contracts will never be immutable keeps the round-trip check, which is the one that guards
+    /// extractability. There is no per-type exemption - either a module's contracts are all immutable, or
+    /// nobody checks and <see cref="VerificationReport.Describe"/> says so out loud (design §10).
+    /// <para>
+    /// The round-trip check has no switch. A verifier that checks nothing should not be registered at all.
+    /// </para>
+    /// </summary>
+    public bool VerifyImmutability { get; set; } = true;
+
+    /// <summary>
     /// Gets or sets the serializer the round-trip check uses - it should be the one the extracted service
     /// will use. Defaults to <see cref="SystemTextJsonContractSerializer"/>.
     /// </summary>

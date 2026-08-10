@@ -3,7 +3,8 @@ using Microsoft.Extensions.DependencyInjection;
 namespace Rebus.InProcCors.Verification;
 
 /// <summary>
-/// Verifies that every message contract handled by a module is round-trip serializable and deeply immutable.
+/// Verifies that every message contract handled by a module is round-trip serializable, and - unless
+/// <see cref="MessageContractVerificationOptions.VerifyImmutability"/> is turned off - deeply immutable.
 /// Register it per module, so each module polices its own contracts: every message type has its handler in
 /// exactly one module by construction, so the host gathers nothing centrally (design §10).
 /// </summary>
@@ -41,18 +42,31 @@ public sealed class MessageContractVerifier
         new(serviceCollections);
 
     /// <summary>
-    /// Runs both checks over every discovered contract and returns the report.
+    /// Creates a verifier over the given collections with explicit options - the entry point for a test in a
+    /// module that turned <see cref="MessageContractVerificationOptions.VerifyImmutability"/> off, which the
+    /// options-less overload cannot express. Options come first because <c>params</c> must come last.
+    /// </summary>
+    /// <param name="options">Overrides for the checks, the serializer and instance construction.</param>
+    /// <param name="serviceCollections">The live service collections to discover handlers in.</param>
+    /// <returns>A verifier over those collections.</returns>
+    public static MessageContractVerifier ForHandlersIn(
+        MessageContractVerificationOptions options, params IServiceCollection[] serviceCollections) =>
+        new(serviceCollections, options);
+
+    /// <summary>
+    /// Runs the enabled checks over every discovered contract and returns the report.
     /// </summary>
     /// <returns>The report describing everything that was checked and everything that failed.</returns>
     public async Task<VerificationReport> VerifyAsync()
     {
         var messageTypes = HandlerMessageTypeDiscovery.Discover(_serviceCollections);
         var violations = new List<VerificationViolation>();
-        var exemptions = new List<VerificationExemption>();
 
         foreach (var messageType in messageTypes)
         {
-            _immutabilityChecker.Check(messageType, violations, exemptions);
+            // Only the immutability walk is skipped. The round trip - the check that guards extractability -
+            // always runs, so this is never a way to verify nothing.
+            if (_options.VerifyImmutability) _immutabilityChecker.Check(messageType, violations);
 
             if (!TryCreateInstance(messageType, out var instance))
             {
@@ -65,7 +79,7 @@ public sealed class MessageContractVerifier
             await _roundTripChecker.CheckAsync(messageType, instance!, violations).ConfigureAwait(false);
         }
 
-        return new VerificationReport(messageTypes, violations, exemptions);
+        return new VerificationReport(messageTypes, violations, _options.VerifyImmutability);
     }
 
     /// <summary>

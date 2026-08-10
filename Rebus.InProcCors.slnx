@@ -5,6 +5,8 @@
   <Folder Name="/SoluionItems/">
     <File Path="Directory.Build.props" />
     <File Path="Directory.Packages.props" />
+    <File Path="Docs/2026-08-09-remote-cancellation-handoff.md" />
+    <File Path="Docs/PRD.md" />
     <File Path="README.md" />
   </Folder>
   <Folder Name="/src/">

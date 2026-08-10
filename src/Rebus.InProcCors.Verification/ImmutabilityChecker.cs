@@ -33,21 +33,19 @@ public sealed class ImmutabilityChecker
     ];
 
     /// <summary>
-    /// Checks <paramref name="messageType"/>, appending anything it finds to <paramref name="violations"/>
-    /// and <paramref name="exemptions"/>.
+    /// Checks <paramref name="messageType"/>, appending anything it finds to <paramref name="violations"/>.
+    /// There is no per-type or per-member exemption: the only escape hatch is
+    /// <see cref="MessageContractVerificationOptions.VerifyImmutability"/>, which switches the whole check
+    /// off for a module (design §10).
     /// </summary>
     /// <param name="messageType">The contract to check.</param>
     /// <param name="violations">Receives everything publicly mutable that was found.</param>
-    /// <param name="exemptions">Receives every <see cref="ImmutabilityExemptAttribute"/> that was honoured.</param>
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="messageType"/> is null.</exception>
-    public void Check(
-        Type messageType,
-        ICollection<VerificationViolation> violations,
-        ICollection<VerificationExemption> exemptions)
+    public void Check(Type messageType, ICollection<VerificationViolation> violations)
     {
         if (messageType == null) throw new ArgumentNullException(nameof(messageType));
 
-        Walk(messageType, messageType, memberPath: "", new HashSet<Type>(), violations, exemptions);
+        Walk(messageType, messageType, memberPath: "", new HashSet<Type>(), violations);
     }
 
     void Walk(
@@ -55,8 +53,7 @@ public sealed class ImmutabilityChecker
         Type currentType,
         string memberPath,
         HashSet<Type> visited,
-        ICollection<VerificationViolation> violations,
-        ICollection<VerificationExemption> exemptions)
+        ICollection<VerificationViolation> violations)
     {
         currentType = Nullable.GetUnderlyingType(currentType) ?? currentType;
 
@@ -64,29 +61,17 @@ public sealed class ImmutabilityChecker
 
         if (TryGetElementType(currentType, out var elementType))
         {
-            Walk(rootType, elementType!, memberPath, visited, violations, exemptions);
+            Walk(rootType, elementType!, memberPath, visited, violations);
             return;
         }
 
         if (!visited.Add(currentType)) return;   // cycle
-
-        if (TryGetExemption(currentType, out var typeReason))
-        {
-            exemptions.Add(new VerificationExemption(rootType, memberPath, typeReason!));
-            return;
-        }
 
         foreach (var property in currentType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
         {
             if (property.GetIndexParameters().Length > 0) continue;
 
             var path = Combine(memberPath, currentType, property.Name, rootType);
-
-            if (TryGetExemption(property, out var propertyReason))
-            {
-                exemptions.Add(new VerificationExemption(rootType, path, propertyReason!));
-                continue;
-            }
 
             if (IsPubliclyWritable(property))
             {
@@ -97,18 +82,12 @@ public sealed class ImmutabilityChecker
 
             if (CheckMemberType(rootType, property.PropertyType, path, violations)) continue;
 
-            Walk(rootType, property.PropertyType, path, visited, violations, exemptions);
+            Walk(rootType, property.PropertyType, path, visited, violations);
         }
 
         foreach (var field in currentType.GetFields(BindingFlags.Public | BindingFlags.Instance))
         {
             var path = Combine(memberPath, currentType, field.Name, rootType);
-
-            if (TryGetExemption(field, out var fieldReason))
-            {
-                exemptions.Add(new VerificationExemption(rootType, path, fieldReason!));
-                continue;
-            }
 
             if (!field.IsInitOnly)
             {
@@ -119,7 +98,7 @@ public sealed class ImmutabilityChecker
 
             if (CheckMemberType(rootType, field.FieldType, path, violations)) continue;
 
-            Walk(rootType, field.FieldType, path, visited, violations, exemptions);
+            Walk(rootType, field.FieldType, path, visited, violations);
         }
 
         visited.Remove(currentType);
@@ -202,13 +181,6 @@ public sealed class ImmutabilityChecker
         // An init accessor is a setter whose return parameter carries a required custom modifier for
         // IsExternalInit. Without this every record reads as mutable and the check is worthless (design §10).
         return !setter.ReturnParameter.GetRequiredCustomModifiers().Contains(typeof(IsExternalInit));
-    }
-
-    static bool TryGetExemption(MemberInfo member, out string? reason)
-    {
-        var attribute = member.GetCustomAttribute<ImmutabilityExemptAttribute>(inherit: false);
-        reason = attribute?.Reason;
-        return attribute != null;
     }
 
     static string Describe(Type type) =>

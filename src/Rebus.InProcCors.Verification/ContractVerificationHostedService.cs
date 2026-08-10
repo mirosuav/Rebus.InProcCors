@@ -29,10 +29,13 @@ sealed class ContractVerificationHostedService : IHostedService
     {
         var report = await _verifier.VerifyAsync().ConfigureAwait(false);
 
-        if (report.Exemptions.Count > 0)
+        if (!report.ImmutabilityVerified)
         {
-            _logger.LogInformation("Message contract verification found {Count} immutability exemption(s): {Report}",
-                report.Exemptions.Count, report.Describe());
+            // Said out loud at every boot: a module that opted out verified less than the default, and a
+            // silent green log would be indistinguishable from a module that verified everything.
+            _logger.LogInformation(
+                "Message contract verification checked round-trip serializability only for {Count} contract(s); " +
+                "the immutability check is disabled for this module.", report.VerifiedTypes.Count);
         }
 
         if (report.IsSuccess) return;
