@@ -85,6 +85,16 @@ public sealed class ReferenceSerializer : ISerializer
             ? type
             : UnknownMessageType;
 
+        // 3a. Not ours at all: the sender used an ordinary serializer. Say so, rather than blame encryption.
+        if (transportMessage.Headers.TryGetValue(Headers.ContentType, out var contentType)
+            && contentType != ReferenceContentType)
+        {
+            throw new InvalidOperationException(
+                $"Received a message of type '{messageType}' serialized as '{contentType}', but this endpoint " +
+                $"uses ReferenceSerializer, which only accepts '{ReferenceContentType}'. Every endpoint that " +
+                "exchanges messages on an InProcNetwork must use the same serializer.");
+        }
+
         throw new InProcReferenceLostException(messageType);
     }
 }

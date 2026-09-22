@@ -255,4 +255,40 @@ public class MessageContractVerifierTests
             return false;
         }
     }
+
+    public sealed record BlobAsArray(string Name, byte[] Payload);
+
+    public sealed record BlobAsMemory(string Name, ReadOnlyMemory<byte> Payload);
+
+    sealed class BlobAsArrayHandler : IHandleMessages<BlobAsArray>
+    {
+        public Task Handle(BlobAsArray message) => Task.CompletedTask;
+    }
+
+    sealed class BlobAsMemoryHandler : IHandleMessages<BlobAsMemory>
+    {
+        public Task Handle(BlobAsMemory message) => Task.CompletedTask;
+    }
+
+    [Fact]
+    public void ALargePayloadAsAByteArrayIsRejected()
+    {
+        var services = new ServiceCollection();
+        services.AddTransient<IHandleMessages<BlobAsArray>, BlobAsArrayHandler>();
+
+        var report = MessageContractVerifier.ForHandlersIn(services).Verify();
+
+        Assert.False(report.IsSuccess);
+    }
+
+    [Fact]
+    public void ALargePayloadAsReadOnlyMemoryPasses()
+    {
+        var services = new ServiceCollection();
+        services.AddTransient<IHandleMessages<BlobAsMemory>, BlobAsMemoryHandler>();
+
+        var report = MessageContractVerifier.ForHandlersIn(services).Verify();
+
+        Assert.True(report.IsSuccess, report.Describe());
+    }
 }

@@ -46,13 +46,42 @@ public sealed class InProcTransport : AbstractRebusTransport, IInitializable, IT
     protected override async Task SendOutgoingMessages(
         IEnumerable<OutgoingTransportMessage> outgoingMessages, ITransactionContext context)
     {
+        // Publish hands one instance to every subscriber (SendOutgoingMessageStep), and some receive steps -
+        // routing slips, forwarding on error - write to the incoming headers in place. The first destination
+        // gets the instance unchanged; each further one gets its own headers dictionary, so concurrent
+        // receivers never share a mutable Dictionary. The body and message object stay shared. The set is
+        // only allocated once a commit carries a second message, keeping the single-send path free.
+        TransportMessage? first = null;
+        HashSet<TransportMessage>? delivered = null;
+
         foreach (var message in outgoingMessages)
         {
-            // Unchanged: the very instance the serializer produced, subclass and all.
-            _network.Deliver(message.DestinationAddress, message.TransportMessage);
+            var transportMessage = message.TransportMessage;
+
+            if (first == null)
+            {
+                first = transportMessage;
+            }
+            else
+            {
+                delivered ??= new HashSet<TransportMessage>(ReferenceEqualityComparer.Instance) { first };
+
+                if (!delivered.Add(transportMessage)) transportMessage = WithOwnHeaders(transportMessage);
+            }
+
+            _network.Deliver(message.DestinationAddress, transportMessage);
         }
 
         await Task.CompletedTask;
+    }
+
+    static TransportMessage WithOwnHeaders(TransportMessage message)
+    {
+        var headers = new Dictionary<string, string>(message.Headers);
+
+        return message is ReferenceTransportMessage reference
+            ? new ReferenceTransportMessage(headers, reference.Body, reference.MessageInstance)
+            : new TransportMessage(headers, message.Body);
     }
 
     /// <inheritdoc />

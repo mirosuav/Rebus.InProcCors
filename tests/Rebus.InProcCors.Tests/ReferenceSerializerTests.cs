@@ -133,4 +133,21 @@ public class ReferenceSerializerTests
 
         Assert.Equal("(no rbs2-msg-type header)", exception.MessageType);
     }
+
+    [Fact]
+    public async Task DeserializeNamesTheSerializerMismatchWhenTheContentTypeIsForeign()
+    {
+        var serializer = CreateSerializer();
+        var headers = new Dictionary<string, string>
+        {
+            [Headers.Type] = typeof(PlaceOrder).FullName!,
+            [Headers.ContentType] = "application/json;charset=utf-8"
+        };
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => serializer.Deserialize(new TransportMessage(headers, new byte[] { 123, 125 })));
+
+        Assert.Contains("application/json", exception.Message);
+        Assert.Contains("same serializer", exception.Message);
+    }
 }

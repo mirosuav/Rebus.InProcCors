@@ -74,6 +74,30 @@ Receive mode is not visible under saturation, and is worth roughly **two and a h
 the first message after an idle period** (~0.4 ms to handler entry, against ~130–160 ms polling). See
 [the benchmark results](Docs/PRD.md#151-results--2026-08-01).
 
+Passing by reference also makes the cost of a message independent of its size. A single message carrying a
+binary payload, send to handler entry (`PayloadSizeBenchmark`, 2026-09-23):
+
+| Payload | InMem + JSON | InProc + JSON | InProc + reference |
+|---|---|---|---|
+| 1 KB | 213 ms / 24 KB | 0.39 ms / 22 KB | 0.34 ms / 19 KB |
+| 1 MB | 221 ms / 2.4 MB | 2.7 ms / 2.4 MB | 0.42 ms / 20 KB |
+| 100 MB | 341 ms / 239 MB | 170 ms / 239 MB | 0.42 ms / 24 KB |
+
+JSON Base64-encodes a byte array, so it allocates about 2.3x the payload on the large object heap. Type a
+large payload as `ReadOnlyMemory<byte>` rather than `byte[]`: an array is mutable and fails the immutability
+check below.
+
+### Capping queues nothing drains
+
+Queues are unbounded. A queue that nothing in the process reads - the error queue above all - keeps every
+message, and with it every message's whole object graph, for the life of the host. Cap it before starting the
+buses; when full, the oldest message is dropped and the sender is never blocked:
+
+```csharp
+var network = new InProcNetwork();
+network.LimitQueue("error", 100);
+```
+
 ## Important: message contracts must be deeply immutable
 
 This is the load-bearing constraint, not a footnote. Passing by reference means several handlers can hold the

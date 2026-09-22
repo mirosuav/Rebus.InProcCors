@@ -120,6 +120,16 @@ public sealed class DefaultMessageInstanceFactory : IMessageInstanceSource
         var item = Create(itemType, Mix(seed, "item"), depth + 1);
         if (item == null) return false;
 
+        // The recommended shape for a large binary payload: a read-only view, where byte[] would fail the
+        // immutability check.
+        if (definition == typeof(ReadOnlyMemory<>))
+        {
+            var backing = Array.CreateInstance(itemType, 1);
+            backing.SetValue(item, 0);
+            collection = Activator.CreateInstance(type, backing);
+            return collection != null;
+        }
+
         var list = (System.Collections.IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(itemType))!;
         list.Add(item);
 

@@ -202,4 +202,94 @@ public class InProcTransportTests
         await transport.UnregisterSubscriber("SomeEvent", "orders");
         Assert.Empty(await transport.GetSubscriberAddresses("SomeEvent"));
     }
+
+    [Fact]
+    public async Task ResetWakesAParkedBlockingReceiveAndTheNextReceiveUsesTheNewQueue()
+    {
+        var network = new InProcNetwork();
+        var transport = CreateTransport(network, "orders", InProcReceiveMode.Blocking);
+
+        using (var scope = new RebusTransactionScope())
+        {
+            var pending = transport.Receive(scope.TransactionContext, CancellationToken.None);
+            Assert.False(pending.IsCompleted);
+
+            network.Reset();
+
+            var completed = await Task.WhenAny(pending, Task.Delay(TimeSpan.FromSeconds(5)));
+            Assert.Same(pending, completed);
+            Assert.Null(await pending);
+        }
+
+        var message = Msg("1");
+        network.Deliver("orders", message);
+
+        using var receiveScope = new RebusTransactionScope();
+        Assert.Same(message, await transport.Receive(receiveScope.TransactionContext, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ResetDiscardsWaitingMessages()
+    {
+        var network = new InProcNetwork();
+        var transport = CreateTransport(network, "orders", InProcReceiveMode.Polling);
+        network.Deliver("orders", Msg("1"));
+
+        network.Reset();
+
+        using var scope = new RebusTransactionScope();
+        Assert.Null(await transport.Receive(scope.TransactionContext, CancellationToken.None));
+        Assert.Equal(0, network.GetCount("orders"));
+    }
+
+    [Fact]
+    public async Task EachDestinationOfOneTransportMessageGetsItsOwnHeaders()
+    {
+        var network = new InProcNetwork();
+        var transport = CreateTransport(network, null);
+        var message = Msg("1");
+
+        using (var scope = new RebusTransactionScope())
+        {
+            await transport.Send("a", message, scope.TransactionContext);
+            await transport.Send("b", message, scope.TransactionContext);
+            await transport.Send("c", message, scope.TransactionContext);
+            await scope.CompleteAsync();
+        }
+
+        var received = new[] { "a", "b", "c" }
+            .Select(address => network.GetOrCreateQueue(address).TryDequeue(out var m) ? m! : null)
+            .ToArray();
+
+        Assert.Same(message, received[0]);
+        Assert.Equal(3, received.Select(m => m!.Headers).Distinct(ReferenceEqualityComparer.Instance).Count());
+        Assert.All(received, m => Assert.Same(message.Body, m!.Body));
+        Assert.All(received, m => Assert.Equal("1", m!.Headers[Headers.MessageId]));
+
+        received[1]!.Headers["mutated"] = "yes";
+        Assert.False(received[0]!.Headers.ContainsKey("mutated"));
+        Assert.False(received[2]!.Headers.ContainsKey("mutated"));
+    }
+
+    [Fact]
+    public async Task DistinctTransportMessagesInOneCommitAreDeliveredUnchanged()
+    {
+        var network = new InProcNetwork();
+        var transport = CreateTransport(network, null);
+        var first = Msg("1");
+        var second = Msg("2");
+
+        using (var scope = new RebusTransactionScope())
+        {
+            await transport.Send("a", first, scope.TransactionContext);
+            await transport.Send("a", second, scope.TransactionContext);
+            await scope.CompleteAsync();
+        }
+
+        var queue = network.GetOrCreateQueue("a");
+        Assert.True(queue.TryDequeue(out var a));
+        Assert.True(queue.TryDequeue(out var b));
+        Assert.Same(first, a);
+        Assert.Same(second, b);
+    }
 }
