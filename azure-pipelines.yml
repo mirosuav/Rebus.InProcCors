@@ -1,0 +1,49 @@
+# Builds, tests and publishes the NuGet packages to the private Azure Artifacts feed.
+# - push to main  -> prerelease  <VersionPrefix>-ci.<BuildId>
+# - tag vX.Y.Z    -> release     X.Y.Z
+
+trigger:
+  branches:
+    include: [main]
+  tags:
+    include: ['v*']
+
+pr: none
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  feed: 'mirek'
+  configuration: Release
+  ${{ if startsWith(variables['Build.SourceBranch'], 'refs/tags/v') }}:
+    versionArgs: "-p:Version=${{ replace(variables['Build.SourceBranch'], 'refs/tags/v', '') }}"
+  ${{ else }}:
+    versionArgs: '-p:VersionSuffix=ci.$(Build.BuildId)'
+
+steps:
+  - task: UseDotNet@2
+    displayName: Install .NET SDK
+    inputs:
+      packageType: sdk
+      version: 10.0.x
+
+  - script: dotnet build Rebus.InProcCors.slnx -c $(configuration) $(versionArgs)
+    displayName: Build
+
+  - script: dotnet test Rebus.InProcCors.slnx -c $(configuration) --no-build
+    displayName: Test
+
+  - script: >-
+      dotnet pack Rebus.InProcCors.slnx -c $(configuration) --no-build
+      -o $(Build.ArtifactStagingDirectory)/packages $(versionArgs)
+    displayName: Pack
+
+  - task: NuGetAuthenticate@1
+    displayName: Authenticate to feed
+
+  - script: >-
+      dotnet nuget push "$(Build.ArtifactStagingDirectory)/packages/*.nupkg"
+      --source https://pkgs.dev.azure.com/mirek/_packaging/$(feed)/nuget/v3/index.json
+      --api-key az --skip-duplicate
+    displayName: Push to $(feed)

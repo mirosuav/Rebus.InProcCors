@@ -8,6 +8,6 @@
     <Authors>Mirek</Authors>
     <PackageProjectUrl>https://github.com/mirosuav/Rebus.InProcCors</PackageProjectUrl>
     <RepositoryUrl>https://github.com/mirosuav/Rebus.InProcCors</RepositoryUrl>
-    <Version>0.1.0</Version>
+    <VersionPrefix>0.1.0</VersionPrefix>
   </PropertyGroup>
 </Project>
